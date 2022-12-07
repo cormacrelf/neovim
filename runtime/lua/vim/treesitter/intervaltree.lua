@@ -324,6 +324,7 @@ end
 ---@param get_range_fn fun(x: any): number, number
 ---@return IntervalTree
 function IntervalTree.new(region, get_range_fn)
+  if region == nil then error("region was nil in IntervalTree.new") end
   return setmetatable(interval_tree_create(region, get_range_fn), IntervalTree)
 end
 
