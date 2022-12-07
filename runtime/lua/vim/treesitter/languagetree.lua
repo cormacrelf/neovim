@@ -1,6 +1,7 @@
 local a = vim.api
 local query = require('vim.treesitter.query')
 local language = require('vim.treesitter.language')
+local RangeTree = require("vim.treesitter.intervaltree").RangeTree
 
 ---@class LanguageTree
 ---@field _callbacks function[] Callback handlers
@@ -9,8 +10,8 @@ local language = require('vim.treesitter.language')
 ---@field _opts table Options
 ---@field _parser userdata Parser for language
 ---@field _regions table List of regions this tree should manage and parse
+---@field _range_tree RangeTree Interval tree structure to clip child regions with
 ---@field _lang string Language name
----@field _regions table
 ---@field _source (number|string) Buffer or string to parse
 ---@field _trees userdata[] Reference to parsed |tstree| (one for each language)
 ---@field _valid boolean If the parsed tree is valid
@@ -30,7 +31,7 @@ LanguageTree.__index = LanguageTree
 ---                                This is useful for overriding the built-in
 ---                                runtime file searching for the injection language
 ---                                query per language.
----@return LanguageTree |LanguageTree| parser object
+---@return LanguageTree _ |LanguageTree| parser object
 function LanguageTree.new(source, lang, opts)
   language.require_language(lang)
   opts = opts or {}
@@ -53,6 +54,8 @@ function LanguageTree.new(source, lang, opts)
     _lang = lang,
     _children = {},
     _regions = {},
+    -- an empty range tree is a null object, does nothing in clip_region()
+    _range_tree = RangeTree.new({}),
     _trees = {},
     _opts = opts,
     _injection_query = injections[lang] and query.parse_query(lang, injections[lang])
@@ -119,7 +122,7 @@ end
 --- determine if any child languages should be created.
 ---
 ---@return userdata[] Table of parsed |tstree|
----@return table Change list
+---@return table|nil Change list
 function LanguageTree:parse()
   if self._valid then
     return self._trees
@@ -168,7 +171,7 @@ function LanguageTree:parse()
         child = self:add_child(lang)
       end
 
-      child:set_included_regions(injection_ranges)
+      child:set_included_regions(injection_ranges, self._regions)
 
       local _, child_changes = child:parse()
 
@@ -270,6 +273,7 @@ function LanguageTree:destroy()
   end
 end
 
+
 ---@alias Region4 Range4[]
 ---@alias Range4 integer[]
 
@@ -292,6 +296,7 @@ end
 --- (in-place)
 ---@private
 ---@param regions Region4[]
+---@return Region6[]
 function LanguageTree:_four_to_six(regions)
   for _, region in ipairs(regions) do
     for i, range in ipairs(region) do
@@ -317,6 +322,17 @@ function LanguageTree:_four_to_six(regions)
   end
 end
 
+local function build_range_tree(parent_regions)
+  local flat = {}
+  for _, region in ipairs(parent_regions) do
+    for _, range in ipairs(region) do
+      table.insert(flat, range)
+    end
+  end
+  local rt = RangeTree.new(flat)
+  return rt
+end
+
 --- Sets the included regions that should be parsed by this |LanguageTree|.
 --- A region is a set of nodes and/or ranges that will be parsed in the same context.
 ---
@@ -334,11 +350,19 @@ end
 --- Note: This call invalidates the tree and requires it to be parsed again.
 ---
 ---@private
----@param regions table List of regions this tree should manage and parse.
-function LanguageTree:set_included_regions(regions)
+---@param parent_regions Region6[]?
+---@param regions Region4[] List of regions this tree should manage and parse.
+function LanguageTree:set_included_regions(regions, parent_regions)
   self:_four_to_six(regions)
 
-  self._regions = regions
+  -- See intervaltree.lua
+  self._range_tree = build_range_tree(parent_regions or {})
+  local clipped_regions = {}
+  for i, region in ipairs(regions) do
+    clipped_regions[i] = self._range_tree:clip_region(region)
+  end
+  self._regions = clipped_regions
+
   -- Trees are no longer valid now that we have changed regions.
   -- TODO(vigoux,steelsojka): Look into doing this smarter so we can use some of the
   --                          old trees for incremental parsing. Currently, this only
@@ -641,7 +665,7 @@ end
 ---@return userdata|nil Found |tsnode|
 function LanguageTree:named_node_for_range(range, opts)
   local tree = self:tree_for_range(range, opts)
-  return tree:root():named_descendant_for_range(unpack(range))
+  return tree and tree:root():named_descendant_for_range(unpack(range)) or nil
 end
 
 --- Gets the appropriate language that contains {range}.
