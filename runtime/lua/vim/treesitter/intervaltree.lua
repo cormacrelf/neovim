@@ -20,6 +20,10 @@
 -- So we have to be careful to split up any ranges when passing them to a child
 -- LanguageTree. This file implements that. Entry point is RangeTree:clip_region().
 
+local clipping = require("vim.treesitter._clipping")
+
+local M = {}
+
 ---@class IPoint
 ---@field point number
 ---@field range any
@@ -215,66 +219,9 @@ local function interval_tree_point_query(tree, point)
   return results
 end
 
--- http://lua-users.org/wiki/BinarySearch
--- Avoid heap allocs for performance
-local default_fcompval = function(value)
-  return value
-end
-local fcompf = function(a, b)
-  return a < b
-end
-local fcompr = function(a, b)
-  return a > b
-end
-
---- Finds values in a _sorted_ list using binary search.
---- If present, returns the range of indices that are == to `value`
---- If absent, returns the insertion point (duplicated), which may go off the end (#t + 1)
----@return integer range start
----@return integer range end
----@return boolean true if value was present
-local function binsearch(t, value, fcompval, reversed)
-  -- Initialise functions
-  fcompval = fcompval or default_fcompval
-  local fcomp = reversed and fcompr or fcompf
-  --  Initialise numbers
-  local iStart, iEnd, iMid = 1, #t, 0
-  local iState = 0
-  -- Binary Search
-  while iStart <= iEnd do
-    -- calculate middle
-    iMid = math.floor((iStart + iEnd) / 2)
-    -- get compare value
-    local value2 = fcompval(t[iMid])
-    -- get all values that match
-    if value == value2 then
-      local tfound, num = { iMid, iMid }, iMid - 1
-      while num > 0 and value == fcompval(t[num]) do
-        tfound[1], num = num, num - 1
-      end
-      num = iMid + 1
-      while num <= #t and value == fcompval(t[num]) do
-        tfound[2], num = num, num + 1
-      end
-      local from, to = unpack(tfound)
-      return from, to, true
-      -- keep searching
-    elseif fcomp(value, value2) then
-      iEnd = iMid - 1
-      iState = 0
-    else
-      iStart = iMid + 1
-      iState = 1
-    end
-  end
-  -- modified to return the right place for such a value to be inserted, with 'false'
-  -- indicating it wasn't in there already
-  return iMid + iState, iMid + iState, false
-end
-
 -- local list = { 1, 2, 3, 3, 4, 6, 7 }
--- binsearch(list, 3) -- {3, 4, true}
--- binsearch(list, 5) -- {6, 6, false}
+-- clipping.binsearch(list, 3) -- {3, 4, true}
+-- clipping.binsearch(list, 5) -- {6, 6, false}
 
 ---@param ipoint IPoint
 ---@return integer
@@ -293,8 +240,8 @@ local function interval_tree_interval_query(tree, from, to)
     return results
   end
 
-  local istart, _ = binsearch(tree.sorted_points, from, getpoint)
-  local _, iend = binsearch(tree.sorted_points, to, getpoint)
+  local istart, _ = clipping.binsearch(tree.sorted_points, from, getpoint)
+  local _, iend = clipping.binsearch(tree.sorted_points, to, getpoint)
   -- insertion may go at the end of the table. we don't want to zoom off the end
   -- when iterating.
   iend = math.min(iend, #tree.sorted_points)
@@ -391,120 +338,10 @@ function RangeTree:overlapping_range6(range)
   return self:overlapping_interval(from, to)
 end
 
--- This is the idea:
--- parent: xxxxxx    xxxx  xxxxx
--- child:    ----------------
--- result:   oooo    iiii  oo
-
---- Sort the 
----@param a Range6
----@param b Range6
-local function overlap_cmp(a, b)
-  local af, at = range_bytes(a)
-  local bf, bt = range_bytes(b)
-  if af < bf then
-    return true
-  elseif at < bt then
-    return true
-  else
-    return false
-  end
-end
-
----@param dst Range6
----@param src Range6
-local function copy_start(dst, src)
-  dst[1] = src[1]
-  dst[2] = src[2]
-  dst[3] = src[3]
-end
-
----@param dst Range6
----@param src Range6
-local function copy_end(dst, src)
-  dst[4] = src[4]
-  dst[5] = src[5]
-  dst[6] = src[6]
-end
-
 ---@return Range6[]
 function RangeTree:clip_range(child)
-  local child_from, child_to = self.interval_tree.get_range_fn(child)
-  local results = {}
-  local overlapping = self:overlapping_interval(child_from, child_to)
-
-  local o2 = {}
-  for _, r in pairs(overlapping) do
-    table.insert(o2, r)
-  end
-  table.sort(o2, overlap_cmp)
-  overlapping = o2
-
-  local last_f, last_t, last_r, coalesced
-  if #overlapping == 0 then
-    return results
-  end
-
-  last_f, last_t = range_bytes(overlapping[1])
-  last_r = { unpack(overlapping[1]) }
-  coalesced = {}
-
-  if #overlapping > 1 then
-    for i = 2, #overlapping do
-      local r = overlapping[i]
-      local f, t = range_bytes(r)
-      if f <= last_f and t >= last_f then
-        -- expand the previous range backwards
-        copy_start(last_r, r)
-        if t > last_t then
-          -- we cover the previous range entirely
-          copy_end(last_r, r)
-        end
-      elseif f >= last_f and f <= last_t and t > last_t then
-        -- expand the previous range forwards
-        copy_end(last_r, r)
-      else
-        table.insert(coalesced, last_r)
-        last_r = { unpack(r) }
-      end
-    end
-  end
-  table.insert(coalesced, last_r)
-
-  for _, parent in ipairs(coalesced) do
-    -- remove at some point
-    parent = { unpack(parent) }
-    -- this would be a zero length range
-    if parent[3] >= parent[6] then
-      goto continue
-    end
-
-    -- parent: xxxxxx    xxxxxxxx
-    -- child:    ------    ----
-    -- result:   oooo      oooo
-    if parent[3] < child_from then
-      copy_start(parent, child)
-    end
-
-    -- parent:   xxxxxx  xxxxxxxx
-    -- child:  ------      ----
-    -- result:   oooo      oooo
-    if parent[6] > child_to then
-      copy_end(parent, child)
-    end
-    -- this would be a zero length range
-    if parent[3] >= parent[6] then
-      goto continue
-    end
-    -- if not modified by previous rules, then it's just wholly contained
-    -- parent:   xxxxxx
-    -- child:  -----------
-    -- result:   iiiiii
-    table.insert(results, parent)
-    ::continue::
-  end
-
-  return results
+  local overlapping = self:overlapping_range6(child)
+  return clipping.clip_range_with_overlaps(child, overlapping)
 end
 
 function RangeTree:clip_region(region)
@@ -527,7 +364,7 @@ function RangeTree:clip_region(region)
   return results
 end
 
-return {
-  RangeTree = RangeTree,
-  IntervalTree = IntervalTree,
-}
+M.RangeTree = RangeTree
+M.IntervalTree = IntervalTree
+
+return M

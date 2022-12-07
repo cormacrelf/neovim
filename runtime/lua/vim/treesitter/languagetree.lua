@@ -1,7 +1,7 @@
 local a = vim.api
 local query = require('vim.treesitter.query')
 local language = require('vim.treesitter.language')
-local RangeTree = require("vim.treesitter.intervaltree").RangeTree
+local clipping = require('vim.treesitter._clipping')
 
 ---@class LanguageTree
 ---@field _callbacks function[] Callback handlers
@@ -10,7 +10,6 @@ local RangeTree = require("vim.treesitter.intervaltree").RangeTree
 ---@field _opts table Options
 ---@field _parser userdata Parser for language
 ---@field _regions table List of regions this tree should manage and parse
----@field _range_trees { [number]: RangeTree } Interval tree structure to clip child regions with
 ---@field _lang string Language name
 ---@field _source (number|string) Buffer or string to parse
 ---@field _trees userdata[] Reference to parsed |tstree| (one for each language)
@@ -54,8 +53,6 @@ function LanguageTree.new(source, lang, opts)
     _lang = lang,
     _children = {},
     _regions = {},
-    -- an empty range tree is a null object, does nothing in clip_region()
-    _range_trees = { RangeTree.new({}) },
     _trees = {},
     _opts = opts,
     _injection_query = injections[lang] and query.parse_query(lang, injections[lang])
@@ -273,7 +270,6 @@ function LanguageTree:destroy()
   end
 end
 
-
 ---@alias Region4 Range4[]
 ---@alias Range4 integer[]
 
@@ -324,17 +320,6 @@ function LanguageTree:_four_to_six(regions_by_tree_index)
   end
 end
 
-local function build_range_tree(parent_regions)
-  local flat = {}
-  for _, region in ipairs(parent_regions) do
-    for _, range in ipairs(region) do
-      table.insert(flat, range)
-    end
-  end
-  local rt = RangeTree.new(flat)
-  return rt
-end
-
 --- Sets the included regions that should be parsed by this |LanguageTree|.
 --- A region is a set of nodes and/or ranges that will be parsed in the same context.
 ---
@@ -360,15 +345,12 @@ function LanguageTree:set_included_regions(regions_by_tree_index, parent_regions
   -- error(vim.inspect(regions_by_tree_index))
 
   -- See intervaltree.lua
-  self._range_trees = {}
   local clipped_regions = {}
   for tree_index, tree_regions in pairs(regions_by_tree_index) do
-    local rt = self._range_trees[tree_index]
-    rt = rt or RangeTree.new(parent_regions[tree_index] or {})
-    self._range_trees[tree_index] = rt
     -- all the languages
+    local haystack = parent_regions[tree_index] or {}
     for _, region in ipairs(tree_regions) do
-      table.insert(clipped_regions, rt:clip_region(region))
+      table.insert(clipped_regions, clipping.clip_region(region, haystack))
     end
   end
   -- error(vim.inspect(clipped_regions))
